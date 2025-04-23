@@ -8,7 +8,7 @@
 
 CH1_mean, CH1_std, CH1_entropy, ..., CH4_band_power, CH4_entropy
 
-—>>>>>>그렇다면 엔트로피의 비중이 낮으므로 키우자( 엔트로피값 *3)
+—>>>>>>그렇다면 엔트로피의 비중이 낮으므로 키우자(엔트로피값 *3)
 ->>>>>> ch별 상위 10개 추출
 ->>>>>> 초단위 라벨링
 ->>>>>> 고장 주파수 반영
@@ -46,7 +46,7 @@ def extract_timestamp(f):
     time_part = name.split("_")[-1].replace(".tdms", "")
     return pd.to_datetime(time_part, format="%Y%m%d%H%M%S")
 
-FAULT_FREQS = [140, 93, 78, 6.7]  # 고장 관련 주파수 (Hz)
+FAULT_FREQS = [140, 93, 78]  # 고장 관련 주파수 (Hz)
 
 def compute_selected_frequency_indices(file_list, channels, top_n=10, sampling_rate=25600):
     psd_by_channel = {ch: [] for ch in channels}
@@ -108,7 +108,7 @@ def extract_features_from_vibration(vib_df, sampling_rate=25600):
         features[f'{ch}_band_power'] = np.sum(Pxx)
 
         if ch in SELECTED_FREQ_INDICES:
-            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)*5
+            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)*3
 
     return features
 
@@ -134,7 +134,7 @@ def process_all_sets(top_folder):
             rul_pairs.append((file_path, rul))
 
 
-    SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(rul_pairs, channels, top_n=8)
+    SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(rul_pairs, channels, top_n=20)
 
     for file_path, rul in rul_pairs:
         try:

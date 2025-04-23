@@ -23,13 +23,16 @@
 import os
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 from glob import glob
 from scipy.stats import kurtosis, skew, spearmanr
 from scipy.signal import welch
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import GRU, Dense, Dropout, MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers  import Adam
 from tensorflow.keras import backend as K
 from nptdms import TdmsFile
 import matplotlib.pyplot as plt
@@ -37,6 +40,44 @@ import matplotlib.pyplot as plt
 SELECTED_FREQ_INDICES = {}
 FREQ_VECTOR = None
 FAULT_FREQS = [140, 93, 78, 6.7]
+# ──────────────────── ❶ 모델 정의 (GRU + Attention) ────────────────────
+
+
+def build_gru_attention_model(seq_len, n_feat,
+                              gru_units=64,
+                              n_heads=4,
+                              attn_key_dim=32,
+                              ff_dim=32,
+                              dropout_rate=0.3):
+    """
+    seq_len : 윈도우 길이 (TIME dimension)
+    n_feat  : 특징 차원
+    """
+    x_in = Input(shape=(seq_len, n_feat))
+
+    # 1) GRU encoder
+    x = GRU(gru_units, return_sequences=True)(x_in)          # (B, T, H)
+
+    # 2) Multi-Head Self-Attention
+    attn = MultiHeadAttention(num_heads=n_heads,
+                              key_dim=attn_key_dim,
+                              dropout=dropout_rate)(x, x, x)
+    x = LayerNormalization(epsilon=1e-6)(x + attn)           # Residual + LN
+
+    # 3) Position-wise FFN
+    ff  = Dense(ff_dim, activation="relu")(x)
+    ff  = Dense(gru_units)(ff)
+    x   = LayerNormalization(epsilon=1e-6)(x + ff)           # Residual + LN
+    x   = Dropout(dropout_rate)(x)
+
+    # 4) 시퀀스 → 벡터 풀링
+    x = GlobalAveragePooling1D()(x)
+
+    # 5) 최종 회귀 헤드
+    out = Dense(1)(x)
+
+    return Model(x_in, out, name="GRU_Attention_RUL")
+
 
 # Custom weighted loss
 def weighted_mae(y_true, y_pred):
@@ -106,7 +147,7 @@ def extract_features_from_vibration(vib_df):
         features[f'{ch}_skew'] = skew(data)
         features[f'{ch}_crest'] = np.max(np.abs(data)) / rms
         features[f'{ch}_band_power'] = np.sum(Pxx)
-        ENTROPY_WEIGHTS = {"CH1":4, "CH2": 4, "CH3": 4, "CH4": 4}
+        ENTROPY_WEIGHTS = {"CH2": 4, "CH3": 4, "CH4": 4}
         if ch in SELECTED_FREQ_INDICES:
             features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch]) ** ENTROPY_WEIGHTS[ch]
     return features
@@ -115,7 +156,7 @@ def process_all_sets(top_folder):
     global SELECTED_FREQ_INDICES, FREQ_VECTOR
     all_rows = []
     rul_pairs = []
-    channels = ["CH1", "CH2", "CH3", "CH4"]
+    channels = ["CH2", "CH3", "CH4"]
     set_folders = sorted([os.path.join(top_folder, d) for d in os.listdir(top_folder) if os.path.isdir(os.path.join(top_folder, d))])
 
     for set_path in set_folders:
@@ -166,13 +207,26 @@ if __name__ == "__main__":
     X_seq, y_seq = create_sequences(X_all, y_all_log, window_size=5)
     X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
 
-    model = Sequential([
-        LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=False),
-        Dense(32, activation='relu'),
-        Dense(1)
-    ])
-    model.compile(optimizer='adam', loss=weighted_mae)
-    model.fit(X_train, y_train, epochs=5000, batch_size=16, validation_data=(X_val, y_val))
+    # ──────────────────── ❷ 모델 빌드 & 학습 부분 교체 ────────────────────
+    # 기존 LSTM 모델 코드 대신 ↓↓↓ 사용
+    model = build_gru_attention_model(
+                seq_len   = X_train.shape[1],
+                n_feat    = X_train.shape[2],
+                gru_units = 64,     # 필요하면 조정
+                n_heads   = 4,
+                attn_key_dim = 32,
+                ff_dim    = 32,
+                dropout_rate = 0.3
+    )
+
+    model.compile(optimizer=Adam(5e-4), loss=weighted_mae)
+
+    model.fit(
+        X_train, y_train,
+        epochs=5000,
+        batch_size=16,
+        validation_data=(X_val, y_val)
+    )
 
     pred_log = model.predict(X_val)
     # 예측값 역변환 및 클리핑

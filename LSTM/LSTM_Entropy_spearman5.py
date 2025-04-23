@@ -13,7 +13,7 @@ CH1_mean, CH1_std, CH1_entropy, ..., CH4_band_power, CH4_entropy
 ->>>>>> 초단위 라벨링
 ->>>>>> 고장 주파수 포함
 ->>>>>> f, Pxx = welch(data, fs=25600, nperseg=4096) 주파수 선택 간격 좁히기기
-->>>>>> 채널 별 가중치 변경  ch2>>ch3>ch4
+->>>>>> 채널 ch1제외 및 가중치 변경 (ch2, ch3, ch4) *4
 '''
 import os
 import numpy as np
@@ -48,7 +48,7 @@ def extract_timestamp(f):
     time_part = name.split("_")[-1].replace(".tdms", "")
     return pd.to_datetime(time_part, format="%Y%m%d%H%M%S")
 
-FAULT_FREQS = [140, 93, 78, 6.7]  # 고장 관련 주파수 (Hz)
+FAULT_FREQS = [140, 93, 78]  # 고장 관련 주파수 (Hz)
 
 def compute_selected_frequency_indices(file_list, channels, top_n=10, sampling_rate=25600):
     psd_by_channel = {ch: [] for ch in channels}
@@ -114,10 +114,10 @@ def extract_features_from_vibration(vib_df, sampling_rate=25600):
         features[f'{ch}_crest'] = np.max(np.abs(data)) / rms
         features[f'{ch}_band_power'] = np.sum(Pxx)
         ENTROPY_WEIGHTS = {
-            "CH1": 1,
-            "CH2": 4,
-            "CH3": 4,
-            "CH4": 4
+            "CH1": 3,
+            "CH2": 3,
+            "CH3": 3,
+            "CH4": 3
         }
         if ch in SELECTED_FREQ_INDICES:
             features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)** ENTROPY_WEIGHTS[ch]
@@ -130,7 +130,7 @@ def process_all_sets(top_folder):
     global SELECTED_FREQ_INDICES, FREQ_VECTOR
     all_rows = []
     rul_pairs = []
-    channels = ["CH2", "CH3",  "CH4"]
+    channels = ["CH1", "CH2", "CH3",  "CH4"]
     set_folders = sorted([os.path.join(top_folder, d) for d in os.listdir(top_folder) if os.path.isdir(os.path.join(top_folder, d))])
 
     for set_path in set_folders:
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     # 채널별 전체 엔트로피 추이 (전체 엔트로피)
-    for ch in ["CH2", "CH3", "CH4"]:
+    for ch in ["CH1", "CH2", "CH3", "CH4"]:
         plt.plot(full_df["RUL"], full_df[f"{ch}_entropy"], '.', label=f"{ch}_entropy")
 
     plt.xlabel("RUL (seconds)")
