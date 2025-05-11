@@ -1,3 +1,8 @@
+# 진동 데이터 기반 GRU 모델을 통한 RUL 예측 전체 파이프라인
+# -----------------------------------------------------------
+# ▶ 특징 추출: Welch → 통계량 + Spearman 기반 주파수 선택 → 에너지 엔트로피
+# ▶ 모델: GRU(64) + Dense(32→1), MAE 기반 학습
+# ▶ 출력: 평균 상대 오차(MARE) 평가 + 모델 저장
 import os
 import numpy as np
 import pandas as pd

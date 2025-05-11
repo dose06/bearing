@@ -1,8 +1,15 @@
 # rul_model_trainer_all_sets.py (with log1p RUL, weighted loss, clipped output + channel-scaled GRU+Attention)
-'''
-->>>>>> f, Pxx = welch(data, fs=25600, 6) 주파수 선택 간격 넓히기
-채널 스캐일러 적용하여 학습률 조정 및 초기값 5.0
 
+'''
+▶ 최종 전략 요약
+--------------------------------------------------
+- Welch 스펙트럼 분석: nperseg=4096
+- 채널 스케일러(ChannelScaler): 각 채널별 γ 가중치 적용
+    · γ 초기값 5.0, 학습률은 5배
+    · 전체 채널 feature에 곱해지는 방식 (mean, std, entropy 등 모두 영향)
+- entropy feature 강조: 각 채널의 entropy에 대해 10제곱 가중치 적용
+- CustomModel: γ 파라미터에만 별도 gradient 스케일링 적용
+- log1p(RUL), weighted MAE, 클리핑(min=10) 등 RUL 안정성 향상 전략 적용
 '''
 import os
 import numpy as np
@@ -33,7 +40,7 @@ class ChannelScaler(Layer):
         self.n_channels = n_channels
         self.gamma = self.add_weight(
             shape=(1, 1, n_channels, 1),
-            initializer=tf.keras.initializers.Constant(5.0),  # ✅ 초기값을 3으로 변경
+            initializer=tf.keras.initializers.Constant(1.0),  # ✅ 초기값을 3으로 변경
             trainable=True,
             name="gamma_channel"
         )
@@ -87,12 +94,12 @@ def build_gru_attention_model(seq_len, n_feat, gru_units=64, n_heads=4, attn_key
     inp = Input(shape=(seq_len, n_feat))
     x = ChannelScaler(n_channels=n_channels, name="ch_scaler")(inp)
     x = GRU(gru_units, return_sequences=True)(x)
-    att = MultiHeadAttention(num_heads=n_heads, key_dim=attn_key_dim, dropout=dropout_rate)(x, x, x)
+    att = MultiHeadAttention(num_heads=n_heads, key_dim=attn_key_dim, dropout=0.0)(x, x, x)  # Dropout 제거
     x = LayerNormalization(epsilon=1e-6)(x + att)
     ffn = Dense(ff_dim, activation="relu")(x)
     ffn = Dense(gru_units)(ffn)
     x = LayerNormalization(epsilon=1e-6)(x + ffn)
-    x = Dropout(dropout_rate)(x)
+    # Dropout 제거됨
     x = GlobalAveragePooling1D()(x)
     out = Dense(1)(x)
     return Model(inp, out, name="GRU_Attn_ChScale")
@@ -126,7 +133,7 @@ def compute_selected_frequency_indices(file_list, channels, top_n=20):
             if ch not in df.columns:
                 continue
             data = df[ch].values
-            f, Pxx = welch(data, fs=25600)
+            f, Pxx = welch(data, fs=25600, nperseg=4096)
             psd_by_channel[ch].append(Pxx)
         rul_list.append(rul)
     selected = {}
@@ -144,7 +151,7 @@ def compute_selected_frequency_indices(file_list, channels, top_n=20):
     return selected, f
 
 def energy_entropy_selected(data, selected_indices):
-    f, Pxx = welch(data, fs=25600)
+    f, Pxx = welch(data, fs=25600, nperseg=4096)
     selected = Pxx[selected_indices]
     selected = selected / np.sum(selected)
     selected = selected[selected > 0]
@@ -155,7 +162,7 @@ def extract_features_from_vibration(vib_df):
     for ch in vib_df.columns:
         data = vib_df[ch].values
         rms = np.sqrt(np.mean(data**2))
-        f, Pxx = welch(data, fs=25600)
+        f, Pxx = welch(data, fs=25600, nperseg=4096)
         features[f'{ch}_mean'] = np.mean(data)
         features[f'{ch}_std'] = np.std(data)
         features[f'{ch}_rms'] = rms
@@ -163,9 +170,9 @@ def extract_features_from_vibration(vib_df):
         features[f'{ch}_skew'] = skew(data)
         features[f'{ch}_crest'] = np.max(np.abs(data)) / rms
         features[f'{ch}_band_power'] = np.sum(Pxx)
-        ENTROPY_WEIGHTS = {"CH1": 10, "CH2": 10, "CH3": 10, "CH4": 10}
+        ENTROPY_WEIGHTS = {"CH1": 3, "CH2": 3, "CH3": 3, "CH4": 3}
         if ch in SELECTED_FREQ_INDICES:
-            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch]) ** ENTROPY_WEIGHTS.get(ch, 1)
+            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch]) * ENTROPY_WEIGHTS.get(ch, 1)
     return features
 
 def process_all_sets(top_folder):
@@ -180,7 +187,7 @@ def process_all_sets(top_folder):
             continue
         file_times = [extract_timestamp(f) for f in tdms_files]
         end_time = max(file_times)
-        for file_path, ts in zip(tdms_files, file_times):
+        for file_path, ts in zip(tdms_files[:-1], file_times[:-1]):
             rul = (end_time - ts).total_seconds()
             rul_pairs.append((file_path, rul))
     SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(rul_pairs, channels, top_n=20)
@@ -203,6 +210,27 @@ def create_sequences(X, y, window_size=5):
         X_seq.append(X[i:i+window_size])
         y_seq.append(y[i + window_size - 1])
     return np.array(X_seq), np.array(y_seq)
+
+
+# 추가: 평가 지표 함수 정의
+
+def compute_percent_error(actual, predicted):
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    nonzero_mask = actual != 0
+    eri = np.zeros_like(actual)
+    eri[nonzero_mask] = 100 * (actual[nonzero_mask] - predicted[nonzero_mask]) / actual[nonzero_mask]
+    return eri
+
+def compute_arul_score(eri):
+    eri = np.array(eri)
+    score = np.where(
+        eri <= 0,
+        np.exp(-np.log(0.5) * eri / 20),
+        np.exp(+np.log(0.5) * eri / 50)
+    )
+    return score
+
 if __name__ == "__main__":
     DATA_ROOT = r"c:/Users/조성찬/OneDrive - UOS/바탕 화면/배어링데이터"
     full_df = process_all_sets(DATA_ROOT)
@@ -211,16 +239,30 @@ if __name__ == "__main__":
     if full_df.empty:
         exit()
 
+
     # 🔥 ❶ RUL이 0인 샘플 제거
     full_df = full_df[full_df["RUL"] > 0].reset_index(drop=True)
 
-    # 🔥 ❷ 정규화 및 시퀀스 생성
-    scaler = MinMaxScaler()
-    X_all = scaler.fit_transform(full_df.drop(columns=["RUL", "file"]))
-    y_all_log = np.log1p(full_df["RUL"].values)
+    # 🔥 ❷ Hold-out 샘플 분리 (고장 직전 파일)
+    holdout_rows = full_df.groupby(full_df['file'].str.extract(r'(Train\d+)')[0]) \
+                            .apply(lambda g: g.loc[g['RUL'].idxmin()]) \
+                            .reset_index(drop=True)
+    train_val_df = pd.concat([full_df, holdout_rows]).drop_duplicates(keep=False)
 
+    # 🔥 ❸ Stratified Split을 위한 RUL 구간 설정
+    bins = [-1, 30, 300, 2000, np.inf]
+    labels = pd.cut(train_val_df["RUL"], bins=bins, labels=False)
+
+    # 🔥 ❹ 시퀀스 생성
+    scaler = MinMaxScaler()
+    X_all = scaler.fit_transform(train_val_df.drop(columns=["RUL", "file"]))
+    y_all_log = np.log1p(train_val_df["RUL"].values)
     X_seq, y_seq = create_sequences(X_all, y_all_log, window_size=5)
-    X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
+    labels_seq = labels[4:]  # 시퀀스 앞부분 제거분 만큼 제외
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_seq, y_seq, test_size=0.2, random_state=42, stratify=labels_seq
+    )
 
         # 🔥 ❸ 모델 학습
     base_model = build_gru_attention_model(
@@ -229,25 +271,25 @@ if __name__ == "__main__":
         n_channels=4
     )
 
-    # 🔄 gamma 학습률을 5배 더 크게 적용
     model = CustomModel(inputs=base_model.input, outputs=base_model.output)
-    model.compile(optimizer=Adam(5e-4), loss=weighted_mae)
+    model.compile(optimizer=Adam(1e-4), loss=weighted_mae)
     model.fit(X_train, y_train, epochs=5000, batch_size=16, validation_data=(X_val, y_val))
 
-    # 🔥 ❹ 평가 (RUL이 0인 샘플 제거된 상태)
+    # ❹ 평가 (log 역변환 + 클리핑)
     pred_log = model.predict(X_val)
     y_val_true = np.expm1(y_val)
     pred = np.expm1(pred_log)
-    pred = np.clip(pred, 10, None)
 
-    # 0 제외하고 평가
     valid_mask = y_val_true > 0
     filtered_y_true = y_val_true[valid_mask]
     filtered_pred = pred.flatten()[valid_mask]
 
-    relative_errors = np.abs((filtered_y_true - filtered_pred) / filtered_y_true)
-    mare = np.mean(relative_errors) * 100
-    print(f"\n [전체 기준] 평균 상대 오차 (MARE): {mare:.2f}%")
+    eri = compute_percent_error(filtered_y_true, filtered_pred)
+    a_rul_scores = compute_arul_score(eri)
+
+    print(f"\n [전체 기준] 평균 상대 오차 (MARE): {np.mean(np.abs(eri)):.2f}%")
+    print(f"정확도 점수 (A_RUL 평균): {np.mean(a_rul_scores):.4f}")
+
 
     # 🔥 ❺ 저장
     model.save("rul_lstm_all_sets.h5")

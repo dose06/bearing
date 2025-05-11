@@ -1,9 +1,16 @@
-# rul_model_trainer_all_sets.py (with log1p RUL, weighted loss, clipped output + channel-scaled GRU+Attention)
-'''
-->>>>>> f, Pxx = welch(data, fs=25600, 6) 주파수 선택 간격 넓히기
-채널 스캐일러 적용 학습률 조정 및 초기값 5.0
+# rul_model_trainer_all_sets.py (GRU+Attention+Channel Scaling + gamma learning rate scaling + entropy emphasis)
 
 '''
+▶ 추가 전략
+--------------------------------------------------
+- Welch 분석의 주파수 해상도 축소 (Pxx 계산 시 디폴트 → 더 넓은 간격)
+- 채널 스케일러 적용: 각 채널에 가중치 γ 적용
+- γ 초기값 = 5.0, γ의 학습률은 다른 파라미터의 5~10배
+- CustomModel 정의: gamma 파라미터만 학습률 스케일링
+- entropy weight 10으로 증가 (CH1 포함)
+- RUL=0 제거 후 학습 (log1p 변환 + 클리핑 + MARE 계산)
+'''
+
 import os
 import numpy as np
 import pandas as pd
@@ -165,7 +172,7 @@ def extract_features_from_vibration(vib_df):
         features[f'{ch}_band_power'] = np.sum(Pxx)
         ENTROPY_WEIGHTS = {"CH1": 10, "CH2": 10, "CH3": 10, "CH4": 10}
         if ch in SELECTED_FREQ_INDICES:
-            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch]) ** ENTROPY_WEIGHTS.get(ch, 1)
+            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch]) * ENTROPY_WEIGHTS.get(ch, 1)
     return features
 
 def process_all_sets(top_folder):
