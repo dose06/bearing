@@ -1,15 +1,29 @@
-# rul_model_trainer_all_sets.py (Spearman 개선: 낮은 threshold + 상위 N개 선택 + 다채널)
+# rul_model_trainer_all_sets.py (with Spearman frequency selection)
 '''
-채널 4개(CH1 ~ CH4) → 어떻게 처리하고 결합했는가?
+진동 데이터 (시간 흐름)
 
-### 결합 방식
+↓
+FFT → 주파수별 진폭
 
-각 채널에서 추출한 특징들을 **하나의 벡터**로 **병렬 결합(concatenate)**합니다.
+**(진동 신호는 시간 도메인에서의 파형인데, 이걸 주파수 도메인으로 바꾸면, 어떤 주파수에 에너지가 얼마나 분포돼 있는지를 알 수 있음)**
 
-CH1_mean, CH1_std, CH1_entropy, ..., CH4_band_power, CH4_entropy
+↓
+정규화된 주파수 에너지
 
-—>>>>>>그렇다면 엔트로피의 비중이 낮으므로 키우자( 엔트로피값 *3)
-->>>>>> ch별 상위 10개 추출
+↓
+선택된 주파수 (Spearman 상관↓)
+
+↓
+정보 엔트로피 계산 (에너지 엔트로피)
+
+↓
+단조 감소하는 특징 신호
+
+↓
+→ 수명 예측 모델의 입력(RUL Regression Target)
+
+Spearman 도입하였지만 제대로 도입 x
+
 '''
 import os
 import numpy as np
@@ -25,7 +39,7 @@ from tensorflow.keras.layers import LSTM, Dense
 from nptdms import TdmsFile
 
 # ▶ Spearman 기반 선택된 주파수 인덱스 초기화
-SELECTED_FREQ_INDICES = {}
+SELECTED_FREQ_INDICES = None
 FREQ_VECTOR = None
 
 # ▶ 진동 데이터 불러오기
@@ -42,39 +56,29 @@ def extract_timestamp(f):
     time_part = name.split("_")[-1].replace(".tdms", "")
     return pd.to_datetime(time_part, format="%Y%m%d%H%M%S")
 
-# ▶ Spearman 기반 주파수 선택 함수 (상위 N개 고정)
-def compute_selected_frequency_indices(file_list, channels, top_n=10, sampling_rate=25600):
-    psd_by_channel = {ch: [] for ch in channels}
-    rul_list = []
-
+# ▶ Spearman 기반 주파수 선택 함수
+def compute_selected_frequency_indices(file_list, channel="CH1", threshold=0.3, sampling_rate=25600):
+    psd_matrix, rul_list = [], []
     for file_path, rul in file_list:
         df = load_vibration_data(file_path)
-        if df.empty:
+        if df.empty or channel not in df.columns:
             continue
-        for ch in channels:
-            if ch not in df.columns:
-                continue
-            data = df[ch].values
-            f, Pxx = welch(data, fs=sampling_rate)
-            psd_by_channel[ch].append(Pxx)
+        data = df[channel].values
+        f, Pxx = welch(data, fs=sampling_rate)
+        psd_matrix.append(Pxx)
         rul_list.append(rul)
 
-    selected = {}
-    for ch in channels:
-        psd_matrix = np.array(psd_by_channel[ch])
-        if psd_matrix.shape[0] == 0:
-            continue
-        rho_list = [abs(spearmanr(psd_matrix[:, i], rul_list)[0]) for i in range(psd_matrix.shape[1])]
-        top_indices = np.argsort(rho_list)[-top_n:]  # 상위 N개 선택
-        selected[ch] = top_indices.tolist()
-
-    print(f" Spearman 기반 주파수 선택 완료 (채널별 {top_n}개)")
+    psd_matrix = np.array(psd_matrix)
+    rul_array = np.array(rul_list)
+    selected = [i for i in range(psd_matrix.shape[1]) if abs(spearmanr(psd_matrix[:, i], rul_array)[0]) >= threshold]
+    print(f"✅ Spearman 상관 기반 선택된 주파수 개수: {len(selected)}")
     return selected, f
 
 # ▶ 에너지 엔트로피 계산 함수 (선택된 주파수 기반)
-def energy_entropy_selected(data, selected_indices, sampling_rate=25600):
+def energy_entropy_selected(data, sampling_rate=25600):
+    global SELECTED_FREQ_INDICES
     f, Pxx = welch(data, fs=sampling_rate)
-    selected = Pxx[selected_indices]
+    selected = Pxx[SELECTED_FREQ_INDICES]
     selected = selected / np.sum(selected)
     selected = selected[selected > 0]
     return -np.sum(selected * np.log(selected))
@@ -95,8 +99,8 @@ def extract_features_from_vibration(vib_df, sampling_rate=25600):
         features[f'{ch}_crest'] = np.max(np.abs(data)) / rms
         features[f'{ch}_band_power'] = np.sum(Pxx)
 
-        if ch in SELECTED_FREQ_INDICES:
-            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)*3
+        if SELECTED_FREQ_INDICES and ch == "CH1":
+            features[f'{ch}_entropy'] = energy_entropy_selected(data, sampling_rate)
 
     return features
 
@@ -105,7 +109,6 @@ def process_all_sets(top_folder):
     global SELECTED_FREQ_INDICES, FREQ_VECTOR
     all_rows = []
     rul_pairs = []
-    channels = ["CH1", "CH2", "CH3", "CH4"]
     set_folders = sorted([os.path.join(top_folder, d) for d in os.listdir(top_folder) if os.path.isdir(os.path.join(top_folder, d))])
 
     for set_path in set_folders:
@@ -116,7 +119,8 @@ def process_all_sets(top_folder):
             rul = (total_files - 1 - i) * 10
             rul_pairs.append((file_path, rul))
 
-    SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(rul_pairs, channels, top_n=10)
+    # Spearman 상관 기반 선택 주파수 계산 (CH1 기준)
+    SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(rul_pairs)
 
     for file_path, rul in rul_pairs:
         try:
@@ -128,7 +132,7 @@ def process_all_sets(top_folder):
             features['RUL'] = rul
             all_rows.append(features)
         except Exception as e:
-            print(f" 오류 발생: {file_path} - {e}")
+            print(f"❌ 오류 발생: {file_path} - {e}")
 
     return pd.DataFrame(all_rows)
 
@@ -148,7 +152,7 @@ if __name__ == "__main__":
     full_df = process_all_sets(DATA_ROOT)
 
     if full_df.empty:
-        print(" full_df가 비어 있습니다.")
+        print("❌ full_df가 비어 있습니다.")
         exit()
 
     print("\n 스케일링 및 시퀀스 구성 중...")
@@ -166,7 +170,7 @@ if __name__ == "__main__":
         Dense(1)
     ])
     model.compile(optimizer='adam', loss='mae')
-    model.fit(X_train, y_train, epochs=10000, batch_size=16, validation_data=(X_val, y_val))
+    model.fit(X_train, y_train, epochs=50, batch_size=16, validation_data=(X_val, y_val))
 
     pred = model.predict(X_val)
     print("\n 평가 결과:")

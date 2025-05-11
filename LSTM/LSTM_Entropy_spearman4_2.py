@@ -48,14 +48,11 @@ def extract_timestamp(f):
 
 FAULT_FREQS = [140, 93, 78]  # 고장 관련 주파수 (Hz)
 
-def compute_selected_frequency_indices(file_list, channels, top_n=10, sampling_rate=25600):
+def compute_selected_frequency_indices(file_list, channels, top_n=20, sampling_rate=25600):
     psd_by_channel = {ch: [] for ch in channels}
     rul_list = []
 
-    for file_path, rul in file_list:
-        df = load_vibration_data(file_path)
-        if df.empty:
-            continue
+    for df, rul in file_list:
         for ch in channels:
             if ch not in df.columns:
                 continue
@@ -72,15 +69,13 @@ def compute_selected_frequency_indices(file_list, channels, top_n=10, sampling_r
 
         rho_list = [abs(spearmanr(psd_matrix[:, i], rul_list)[0]) for i in range(psd_matrix.shape[1])]
         top_indices = np.argsort(rho_list)[-top_n:]
-
-        # 고장 주파수 인덱스 포함시키기
         fault_indices = [np.argmin(np.abs(f - ff)) for ff in FAULT_FREQS]
         total_indices = sorted(set(top_indices.tolist() + fault_indices))
-
         selected[ch] = total_indices
 
-    print(f" Spearman+Fault 기반 주파수 선택 완료 (채널별 총 {len(selected[channels[0]])}개)")
+    print(f"[✓] 초 단위 Spearman+Fault 기반 주파수 선택 완료 (총 {len(selected[channels[0]])}개)")
     return selected, f
+
 
 
 # ▶ 에너지 엔트로피 계산 함수 (선택된 주파수 기반)
@@ -113,42 +108,56 @@ def extract_features_from_vibration(vib_df, sampling_rate=25600):
     return features
 
 # ▶ 전체 데이터 처리 함수
-def process_all_sets(top_folder):
+SAMPLING_RATE = 25600  # 1초 = 25600개
+
+# ❶ 초 단위로 슬라이싱
+def split_into_seconds(df, sampling_rate=25600):
+    one_sec = sampling_rate
+    num_sec = df.shape[0] // one_sec
+    return [df.iloc[i * one_sec : (i + 1) * one_sec] for i in range(num_sec)]
+
+# ---------- 전체 데이터 로딩 (마지막 TDMS는 hold-out) ---------- ★변경
+def process_all_sets(top_folder, top_n=20, sampling_rate=25600):
     global SELECTED_FREQ_INDICES, FREQ_VECTOR
-    all_rows = []
-    rul_pairs = []
+
+    rows = []
+    pairs = []  # (df, rul, file_name)
+
     channels = ["CH1", "CH2", "CH3", "CH4"]
-    set_folders = sorted([os.path.join(top_folder, d) for d in os.listdir(top_folder) if os.path.isdir(os.path.join(top_folder, d))])
+    train_folders = sorted(glob(os.path.join(top_folder, "Train*")))
 
-    for set_path in set_folders:
-        tdms_files = sorted(glob(os.path.join(set_path, "*.tdms")), key=extract_timestamp)
-        if not tdms_files:
-            print(f"⚠️ {set_path} 폴더에 .tdms 파일이 없습니다. 건너뜁니다.")
-            continue  # 이 폴더는 건너뜀
-        
-        file_times = [extract_timestamp(f) for f in tdms_files]
-        end_time = max(file_times)
+    for set_path in train_folders:
+        files = sorted(glob(os.path.join(set_path, "*.tdms")), key=extract_timestamp)
+        if not files:
+            print(f"⚠️ {set_path} 폴더에 TDMS 파일 없음")
+            continue
 
-        for file_path, ts in zip(tdms_files[:-1], file_times[:-1]):
-            rul = (end_time - ts).total_seconds()  # 🔥 초 단위 RUL
-            rul_pairs.append((file_path, rul))
+        ts_all = [extract_timestamp(f) for f in files]
+        end_t = max(ts_all)
 
-
-    SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(rul_pairs, channels, top_n=20)
-
-    for file_path, rul in rul_pairs:
-        try:
-            vib_df = load_vibration_data(file_path)
-            if vib_df.empty:
+        for f, ts in zip(files, ts_all):
+            df = load_vibration_data(f)
+            if df.empty:
                 continue
-            features = extract_features_from_vibration(vib_df)
-            features['file'] = os.path.basename(file_path)
-            features['RUL'] = rul
-            all_rows.append(features)
-        except Exception as e:
-            print(f" 오류 발생: {file_path} - {e}")
+            rul = (end_t - ts).total_seconds()
+            pairs.append((df, rul, os.path.basename(f)))
 
-    return pd.DataFrame(all_rows)
+    # Spearman 기반 주파수 선택
+    pairs_for_selection = [(df, rul) for df, rul, _ in pairs]
+    SELECTED_FREQ_INDICES, FREQ_VECTOR = compute_selected_frequency_indices(
+        pairs_for_selection, channels, top_n=top_n, sampling_rate=sampling_rate
+    )
+
+    # 특징 추출 (1초 단위 슬라이싱)
+    for df, rul, fname in pairs:
+        for sec_df in split_into_seconds(df, sampling_rate):
+            feats = extract_features_from_vibration(sec_df, sampling_rate)
+            feats.update({'file': fname, 'RUL': rul})
+            rows.append(feats)
+
+    full_df = pd.DataFrame(rows)
+    return full_df
+
 
 # ▶ 시퀀스 구성 함수
 def create_sequences(X, y, window_size=5):
@@ -178,76 +187,66 @@ def compute_arul_score(eri):
     )
     return score
 
-# ▶ 메인 실행부
+WINDOW = 5                               # 시퀀스 길이
+
+
 if __name__ == "__main__":
     DATA_ROOT = r"c:/Users/조성찬/OneDrive - UOS/바탕 화면/배어링데이터"
+    print("\n📦 진동 특징 추출 및 RUL 생성 중...")
+    
+    full_df = process_all_sets(DATA_ROOT)  # holdout_list 안 씀
+    full_df = full_df.sort_values(by='file')
 
-    print("\n 진동 특징 추출 및 RUL 생성 중...")
-    full_df = process_all_sets(DATA_ROOT)
-    full_df = full_df.sort_values(by='file')  # 또는 시간 기준 정렬
+    if full_df.empty:
+        print("❌ full_df가 비어 있습니다.")
+        exit()
 
-# ───────────────────────────────────────────────
-# ❶ 마지막 TDMS 파일(고장 직전) → 항상 hold-out
-#    · train / val split에서는 제외
-#    · 모델 학습 끝난 뒤 별도로 점수 확인 가능
-# ───────────────────────────────────────────────    
+    # ❶ 고장 직전(최소 RUL) 파일 → hold-out
     holdout_rows = full_df.groupby(full_df['file'].str.extract(r'(Train\d+)')[0]) \
-                        .apply(lambda g: g.loc[g['RUL'].idxmin()]) \
-                        .reset_index(drop=True)
+                          .apply(lambda g: g.loc[g['RUL'].idxmin()]) \
+                          .reset_index(drop=True)
 
     train_val_df = pd.concat([full_df, holdout_rows]).drop_duplicates(keep=False)
 
-    if full_df.empty:
-        print(" full_df가 비어 있습니다.")
-        exit()
-
-    print("\n 스케일링 및 시퀀스 구성 중...")
+    print("\n🧪 스케일링 및 시퀀스 구성 중...")
     scaler = MinMaxScaler()
-    # ───────────────────────────────────────────────
-    # ❷ stratify 라벨 생성 (예: 4개의 RUL 구간)
-    # ───────────────────────────────────────────────
-    bins   = [-1, 30, 300, 2000, np.inf]        # 매우 작음 / 작음 / 중간 / 큼
+    
+    # ❷ stratify 라벨 생성
+    bins   = [-1, 30, 300, 2000, np.inf]
     labels = pd.cut(train_val_df["RUL"], bins=bins, labels=False)
 
-    # 스케일링 & 시퀀스
+    # 시퀀스 구성
     X_all = scaler.fit_transform(train_val_df.drop(columns=["RUL", "file"]))
     y_all = train_val_df["RUL"].values
     X_seq, y_seq = create_sequences(X_all, y_all, window_size=5)
+    labels_seq   = labels[5-1:].to_numpy()  # WINDOW = 5
 
     # stratified split
-    labels_seq = labels[4:]                 # 시퀀스로 잘려-나간 앞 4개 제외
-    X_train, X_val, y_train, y_val, lab_tr, lab_val = train_test_split(
-            X_seq, y_seq, labels_seq,       # ① X ② y ③ stratify 기준 → 3개를 동시에 넣으면
-            test_size=0.1, random_state=42, stratify=labels_seq
+    X_train, X_val, y_train, y_val, _, _ = train_test_split(
+        X_seq, y_seq, labels_seq,
+        test_size=0.1, random_state=42, stratify=labels_seq
     )
-    # lab_tr, lab_val 는 딱히 안 써도 되지만 개수 맞추려고 받아 둡니다
-
-
-    print("\n LSTM 모델 학습 시작...")
+    print(f"\n📏 전체 row 수: {len(full_df)}개, 시퀀스 수: {len(X_seq)}개")
+    print("\n🧠 LSTM 모델 학습 시작...")
     model = Sequential([
-        LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=False),
+        LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2])),
         Dense(32, activation='relu'),
         Dense(1)
     ])
     model.compile(optimizer='adam', loss='mae')
-    model.fit(X_train, y_train, epochs=5000, batch_size=16, validation_data=(X_val, y_val))
+    model.fit(X_train, y_train, epochs=1000, batch_size=16, validation_data=(X_val, y_val))
 
-
+    print("\n📊 검증 데이터 예측 중...")
     pred = model.predict(X_val).flatten()
     actual = y_val
 
-
-    # 1. 오차 계산
+    # 오차 및 평가 점수
     eri = compute_percent_error(actual, pred)
+    a_rul = compute_arul_score(eri)
 
-    # 2. A_RUL 점수 변환
-    a_rul_scores = compute_arul_score(eri)
-
-    # 3. 최종 점수 출력
-    print(f"\n평균 상대 오차 (MARE): {np.mean(np.abs(eri)):.2f}%")
-    print(f"정확도 점수 (A_RUL 평균): {np.mean(a_rul_scores):.4f}")
-
-
+    print(f"\n✅ 평균 상대 오차 (MARE): {np.mean(np.abs(eri)):.2f}%")
+    print(f"✅ A_RUL 평균 점수     : {np.mean(a_rul):.4f}")
 
     model.save("rul_lstm_all_sets.h5")
-    print("\n모델이 rul_lstm_all_sets.h5로 저장되었습니다.")
+    print("\n💾 모델이 'rul_lstm_all_sets.h5'로 저장되었습니다.")
+    

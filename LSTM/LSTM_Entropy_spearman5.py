@@ -13,7 +13,7 @@ CH1_mean, CH1_std, CH1_entropy, ..., CH4_band_power, CH4_entropy
 ->>>>>> 초단위 라벨링
 ->>>>>> 고장 주파수 포함
 ->>>>>> f, Pxx = welch(data, fs=25600, nperseg=4096) 주파수 선택 간격 좁히기기
-->>>>>> 채널 ch1제외 및 가중치 변경 (ch2, ch3, ch4) *4
+->>>>>> 채널 가중치 변경 (ch1, ch2, ch3, ch4) *4
 '''
 import os
 import numpy as np
@@ -120,7 +120,7 @@ def extract_features_from_vibration(vib_df, sampling_rate=25600):
             "CH4": 3
         }
         if ch in SELECTED_FREQ_INDICES:
-            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)** ENTROPY_WEIGHTS[ch]
+            features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)* ENTROPY_WEIGHTS[ch]
 
 
     return features
@@ -142,7 +142,7 @@ def process_all_sets(top_folder):
         file_times = [extract_timestamp(f) for f in tdms_files]
         end_time = max(file_times)
 
-        for file_path, ts in zip(tdms_files, file_times):
+        for file_path, ts in zip(tdms_files[:-1], file_times[:-1]):   # 마지막 파일 제외
             rul = (end_time - ts).total_seconds()  # 🔥 초 단위 RUL
             rul_pairs.append((file_path, rul))
 
@@ -171,6 +171,25 @@ def create_sequences(X, y, window_size=5):
         y_seq.append(y[i + window_size - 1])
     return np.array(X_seq), np.array(y_seq)
 
+def compute_percent_error(actual, predicted):
+    """예측 오차 (백분율 %) 계산"""
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    nonzero_mask = actual != 0
+    eri = np.zeros_like(actual)
+    eri[nonzero_mask] = 100 * (actual[nonzero_mask] - predicted[nonzero_mask]) / actual[nonzero_mask]
+    return eri
+
+def compute_arul_score(eri):
+    """ERI (백분율 오차)를 기반으로 A_RUL 점수 계산"""
+    eri = np.array(eri)
+    score = np.where(
+        eri <= 0,
+        np.exp(-np.log(0.5) * eri / 20),
+        np.exp(+np.log(0.5) * eri / 50)
+    )
+    return score
+
 # ▶ 메인 실행부
 if __name__ == "__main__":
     DATA_ROOT = r"c:/Users/조성찬/OneDrive - UOS/바탕 화면/배어링데이터"
@@ -179,20 +198,42 @@ if __name__ == "__main__":
     full_df = process_all_sets(DATA_ROOT)
     full_df = full_df.sort_values(by='file')  # 또는 시간 기준 정렬
 
+# ───────────────────────────────────────────────
+# ❶ 마지막 TDMS 파일(고장 직전) → 항상 hold-out
+#    · train / val split에서는 제외
+#    · 모델 학습 끝난 뒤 별도로 점수 확인 가능
+# ───────────────────────────────────────────────    
+    holdout_rows = full_df.groupby(full_df['file'].str.extract(r'(Train\d+)')[0]) \
+                        .apply(lambda g: g.loc[g['RUL'].idxmin()]) \
+                        .reset_index(drop=True)
+
+    train_val_df = pd.concat([full_df, holdout_rows]).drop_duplicates(keep=False)
+
     if full_df.empty:
         print(" full_df가 비어 있습니다.")
         exit()
 
     print("\n 스케일링 및 시퀀스 구성 중...")
     scaler = MinMaxScaler()
-    X_all = scaler.fit_transform(full_df.drop(columns=["RUL", "file"]))
-    y_all = full_df["RUL"].values
+    # ───────────────────────────────────────────────
+    # ❷ stratify 라벨 생성 (예: 4개의 RUL 구간)
+    # ───────────────────────────────────────────────
+    bins   = [-1, 30, 300, 2000, np.inf]        # 매우 작음 / 작음 / 중간 / 큼
+    labels = pd.cut(train_val_df["RUL"], bins=bins, labels=False)
 
-    # 시퀀스 구성
+    # 스케일링 & 시퀀스
+    X_all = scaler.fit_transform(train_val_df.drop(columns=["RUL", "file"]))
+    y_all = train_val_df["RUL"].values
     X_seq, y_seq = create_sequences(X_all, y_all, window_size=5)
 
+    # stratified split
+    labels_seq = labels[4:]                 # 시퀀스로 잘려-나간 앞 4개 제외
+    X_train, X_val, y_train, y_val, lab_tr, lab_val = train_test_split(
+            X_seq, y_seq, labels_seq,       # ① X ② y ③ stratify 기준 → 3개를 동시에 넣으면
+            test_size=0.1, random_state=42, stratify=labels_seq
+    )
+    # lab_tr, lab_val 는 딱히 안 써도 되지만 개수 맞추려고 받아 둡니다
 
-    X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
 
     print("\n LSTM 모델 학습 시작...")
     model = Sequential([
@@ -203,12 +244,21 @@ if __name__ == "__main__":
     model.compile(optimizer='adam', loss='mae')
     model.fit(X_train, y_train, epochs=5000, batch_size=16, validation_data=(X_val, y_val))
 
-    pred = model.predict(X_val)
-   # ▶ 상대 오차(%) 계산
-    nonzero_mask = y_val != 0
-    relative_errors = np.abs((y_val[nonzero_mask] - pred[nonzero_mask].flatten()) / y_val[nonzero_mask])
-    mare = np.mean(relative_errors) * 100
-    print(f"\n 평균 상대 오차 (MARE): {mare:.2f}%")
+
+    pred = model.predict(X_val).flatten()
+    actual = y_val
+
+
+    # 1. 오차 계산
+    eri = compute_percent_error(actual, pred)
+
+    # 2. A_RUL 점수 변환
+    a_rul_scores = compute_arul_score(eri)
+
+    # 3. 최종 점수 출력
+    print(f"\n평균 상대 오차 (MARE): {np.mean(np.abs(eri)):.2f}%")
+    print(f"정확도 점수 (A_RUL 평균): {np.mean(a_rul_scores):.4f}")
+
 
 
     model.save("rul_lstm_all_sets.h5")

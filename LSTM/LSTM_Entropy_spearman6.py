@@ -19,6 +19,7 @@
 # 1. RUL log 변환 (log1p) → 모델 안정화
 # 2. 손실 함수 weighted MAE → 작은 RUL 강조
 # 3. 예측값 클리핑 (min=10) → MARE 튀는 현상 방지
+# -> 이 후 데이터 셋의 마지막 파일 제외하므로써 예측값 클리핑 제외
 '''
 import os
 import numpy as np
@@ -124,7 +125,8 @@ def process_all_sets(top_folder):
             continue
         file_times = [extract_timestamp(f) for f in tdms_files]
         end_time = max(file_times)
-        for file_path, ts in zip(tdms_files, file_times):
+
+        for file_path, ts in zip(tdms_files[:-1], file_times[:-1]):     # ← 마지막 파일 제외file_times[:-1]):
             rul = (end_time - ts).total_seconds()
             rul_pairs.append((file_path, rul))
 
@@ -151,47 +153,73 @@ def create_sequences(X, y, window_size=5):
         y_seq.append(y[i + window_size - 1])
     return np.array(X_seq), np.array(y_seq)
 
+
+def compute_percent_error(actual, predicted):
+    """예측 오차 (백분율 %) 계산"""
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    nonzero_mask = actual != 0
+    eri = np.zeros_like(actual)
+    eri[nonzero_mask] = 100 * (actual[nonzero_mask] - predicted[nonzero_mask]) / actual[nonzero_mask]
+    return eri
+
+def compute_arul_score(eri):
+    """ERI (백분율 오차)를 기반으로 A_RUL 점수 계산"""
+    eri = np.array(eri)
+    score = np.where(
+        eri <= 0,
+        np.exp(-np.log(0.5) * eri / 20),
+        np.exp(+np.log(0.5) * eri / 50)
+    )
+    return score
+
+
+WINDOW = 5                      # 시퀀스 길이
+BINS   = [-1, 30, 300, 2000, np.inf]   # stratify 구간
+# ─────────────────────────────── main ────────────────────────────────
 if __name__ == "__main__":
     DATA_ROOT = r"c:/Users/조성찬/OneDrive - UOS/바탕 화면/배어링데이터"
-    full_df = process_all_sets(DATA_ROOT)
-    full_df = full_df.sort_values(by='file')
+    full_df   = process_all_sets(DATA_ROOT).sort_values('file')
 
-    if full_df.empty:
-        exit()
+    if full_df.empty: raise SystemExit("❌ full_df가 비어 있습니다")
 
+    # ──★ stratify 라벨 (RUL 구간)
+    labels = pd.cut(full_df["RUL"], bins=BINS, labels=False)
+
+    # 스케일링
     scaler = MinMaxScaler()
-    X_all = scaler.fit_transform(full_df.drop(columns=["RUL", "file"]))
-    y_all_log = np.log1p(full_df["RUL"].values)  # log1p 변환
+    X_all  = scaler.fit_transform(full_df.drop(columns=["RUL","file"]))
+    y_all  = np.log1p(full_df["RUL"].values)           # log1p 변환
 
-    X_seq, y_seq = create_sequences(X_all, y_all_log, window_size=5)
-    X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
+    # 시퀀스
+    X_seq, y_seq       = create_sequences(X_all, y_all, window_size=WINDOW)
+    labels_seq         = labels[WINDOW-1:].to_numpy()  # ──★ 앞 WINDOW-1개 drop
 
+    # stratified split (train 90 % / val 10 %)
+    X_tr, X_val, y_tr, y_val, lab_tr, lab_val = train_test_split(
+        X_seq, y_seq, labels_seq,
+        test_size=0.1, random_state=42, stratify=labels_seq)
+
+    # ──────────────────── LSTM ────────────────────
     model = Sequential([
-        LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=False),
+        LSTM(64, input_shape=(WINDOW, X_seq.shape[2])),
         Dense(32, activation='relu'),
         Dense(1)
     ])
     model.compile(optimizer='adam', loss=weighted_mae)
-    model.fit(X_train, y_train, epochs=5000, batch_size=16, validation_data=(X_val, y_val))
+    model.fit(X_tr, y_tr, epochs=5000, batch_size=16,
+              validation_data=(X_val, y_val))
 
-    pred_log = model.predict(X_val)
-    # 예측값 역변환 및 클리핑
-    # 역변환
-    y_val_true = np.expm1(y_val)
-    pred = np.expm1(pred_log)
+    # ───────── 평가 (역변환, 클리핑, MARE / A_RUL) ─────────
+    pred_log = model.predict(X_val).flatten()
+    pred     = np.clip(np.expm1(pred_log), 10, None)
+    y_true   = np.expm1(y_val)
 
-    # 예측 클리핑은 유지 (모델이 마이너스 RUL 예측할 수도 있으니까)
-    pred = np.clip(pred, 10, None)
+    eri   = compute_percent_error(y_true, pred)
+    a_rul = compute_arul_score(eri)
 
-    # 진짜 전체에 대해 상대 오차 계산
-    relative_errors = np.abs((y_val_true - pred.flatten()) / y_val_true)
-
-    # 무한대 또는 NaN 제거 (계산은 하되 평균에 포함 안 함)
-    relative_errors = relative_errors[np.isfinite(relative_errors)]
-
-    mare = np.mean(relative_errors) * 100
-    print(f"\n [전체 기준] 평균 상대 오차 (MARE): {mare:.2f}%")
-
+    print(f"\n평균 상대 오차 (MARE)   : {np.mean(np.abs(eri)):.2f}%")
+    print(f"A_RUL 평균 점수        : {np.mean(a_rul):.4f}")
 
     model.save("rul_lstm_all_sets.h5")
-    print("\n모델이 rul_lstm_all_sets.h5로 저장되었습니다.")
+    print("✅ 모델 저장 완료")
