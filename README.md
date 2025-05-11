@@ -16,12 +16,19 @@ Spearman 상관 기반 주파수 선택
  2. 손실 함수 weighted MAE → 작은 RUL 강조
  3. 예측값 클리핑 (min=10) → MARE 튀는 현상 방지
 
+
 모델변화 
 GRU+attention
+-> 데이터 양에 비해서 많은 파라미터 수로 과적합이 유발 되었음
+-> 엔트로피 가중치를 파라미터화 시키려면 attention을 사용해야하는거같은데 파라미터가 너무 많아져서 쓰기가 어려울거같음
 
-위의 순서로 발전시켜왔습니다.
 
-.cvs 파일은 데이터 확인용입니다
+random seed 를 통해서만 셋을 고정하던걸 hold-out, Stratified split을 통해서 고정해두니 지금까지와는 다른 비교양상
+RUL log 변환 (log1p),  손실 함수 weighted MAE,  주파수 분해능 향상 등이 모델에 좋은영향을 주는 점을 알수있었음
+또한 마지막 파일을 훈련 및 평가 셋에 포함하는가 안하는가에 따라서 상대 오차 평균이 많이 달라졌음
+지금까지 10초간 측정한 파일의 RUL을 하나로 정하였지만 10초를 1초단위로 나누어 정밀도를 향상시켰고, 결과가 더 좋았음 
 
-노션정리 주소
-[https://ambiguous-origami-76c.notion.site/1d59d01c0fbe806ba862cf6062a856ac?pvs=4](https://ambiguous-origami-76c.notion.site/1d59d01c0fbe806ba862cf6062a856ac?pvs=4)
+  
+
+노션 정리 주소
+https://ambiguous-origami-76c.notion.site/1d59d01c0fbe806ba862cf6062a856ac?pvs=4
