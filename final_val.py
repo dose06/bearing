@@ -161,7 +161,7 @@ def process_all_sets(top_folder, top_n=20, sampling_rate=25600):
 
 WINDOW = 5
 DATA_ROOT = r"c:/Users/조성찬/OneDrive - UOS/바탕 화면/배어링데이터"
-MODEL_PATH = "rul_final_all_sets.h5"
+MODEL_PATH = "rul_final2_all_sets.h5"
 
 # ─────────────────────────────────────────────────────
 # 기존 import, 함수(process_all_sets, split_into_seconds 등) 그대로 둡니다.
@@ -214,6 +214,18 @@ for vid in range(1, 7):
         pred = model.predict(seq.reshape(1, WINDOW, -1), verbose=0)[0, 0] + 600
         preds.append(pred)
         print(f"Validation{vid} (offset {i}, +600): {pred:.1f}")
+
+    offset_base = 19
+    for i in range(5):
+        start = -(offset_base + WINDOW + i)
+        end   = - (offset_base + i)
+        seq   = X_all[start:end]
+        if len(seq) != WINDOW:
+            print(f"Validation{vid} (offset {i}, +1200): 시퀀스 길이 {len(seq)}로 SKIP")
+            continue
+        pred = model.predict(seq.reshape(1, WINDOW, -1), verbose=0)[0, 0] + 1200
+        preds.append(pred)
+        print(f"Validation{vid} (offset {i}, +1200): {pred:.1f}")
 
 
     # preds에 10개의 예측값이 담긴 뒤

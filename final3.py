@@ -77,6 +77,68 @@ def compute_selected_frequency_indices(file_list, channels, top_n=20, sampling_r
     return selected, f
 
 
+def iso_life_loss_from_torque(
+    torque_series,
+    shaft_radius_m = 0.015,         # 축 반경 [m]
+    Fa_N = 15_000.0,                # 고정 축방향 하중 [N]
+    C_dyn_N = 59_500.0,             # 동적 정격 하중 [N]
+    rpm_ref = 1000,                 # 회전 속도 [rpm]
+    X_coef = 0.56, Y_coef = 1.5     # 테이퍼 베어링용 ISO 계수
+):
+    """
+    ISO 281 기반 수명 소모율 계산 (토크 기반 반경하중 + 고정 축방향 하중)
+    
+    Parameters
+    ----------
+    torque_series : np.ndarray or pd.Series
+        1초간 토크 [N·m]
+    shaft_radius_m : float
+        회전축 반경 [m] (예: 25 mm)
+    Fa_N : float
+        축방향 하중 [N] (정격값 고정)
+    C_dyn_N : float
+        동적 정격 하중 [N] (예: 59.5 kN)
+    rpm_ref : int
+        회전 속도 [rpm]
+    X_coef, Y_coef : float
+        ISO 281의 하중 계수
+
+    Returns
+    -------
+    float
+        iso_life_loss : 1초당 수명 소모율 (0~1 사이 소수)
+    """
+
+    # ① 평균 토크 → 반경방향 하중 [N]
+    torque_mean = np.mean(np.abs(torque_series))
+    Fr_N = torque_mean / shaft_radius_m
+
+    # ② 등가 하중 계산 (ISO 기준)
+    P_N = X_coef * Fr_N + Y_coef * Fa_N
+    P_N = max(P_N, 1.0)  # 안정성 확보 (0 나눗셈 방지)
+
+    # ③ ISO 281 수명 계산 (백만 회전 단위)
+    L10_revs = (C_dyn_N / P_N) ** (10 / 3) * 1_000_000
+
+    # ④ 회전수를 시간으로 환산 → 수명 [초]
+    rev_per_sec = rpm_ref / 60
+    life_sec = L10_revs / rev_per_sec
+
+    # ⑤ 1초 슬라이스니까, 전체 수명 중 1초만큼 닳음
+    return float(1.0 / life_sec)
+
+def compute_ETCI_inverse_group(entropy_vals, temp_celsius):
+    T_K = temp_celsius + 273.15
+    mean_entropy = np.mean([max(e, 1e-6) for e in entropy_vals])
+    return (1.0 / mean_entropy) * np.log(T_K)
+
+
+
+def grease_thermal_degradation(temp_celsius, T_max=200, R=8.314):
+    T_K = temp_celsius + 273.15
+    T_limit = T_max + 273.15
+    return np.exp(-(T_K / T_limit))  # 온도가 높을수록 수명지표 감소
+
 
 # ▶ 에너지 엔트로피 계산 함수 (선택된 주파수 기반)
 def energy_entropy_selected(data, selected_indices, sampling_rate=25600):
@@ -89,6 +151,8 @@ def energy_entropy_selected(data, selected_indices, sampling_rate=25600):
 # ▶ 특징 추출 함수
 def extract_features_from_vibration(vib_df, sampling_rate=25600):
     features = {}
+    Pxx_dict = {}
+    entropy_dict = {}
     for ch in vib_df.columns:
         data = vib_df[ch].values
         rms = np.sqrt(np.mean(data**2))
@@ -104,6 +168,69 @@ def extract_features_from_vibration(vib_df, sampling_rate=25600):
 
         if ch in SELECTED_FREQ_INDICES:
             features[f'{ch}_entropy'] = energy_entropy_selected(data, SELECTED_FREQ_INDICES[ch], sampling_rate)*3
+            # ── PSD 계산 (모든 채널 공통) ──
+        _, Pxx = welch(data, fs=sampling_rate)
+        Pxx_dict[ch] = Pxx  # ✅ Pxx 저장
+        
+        # 엔트로피 (선택 주파수만)
+        if ch in SELECTED_FREQ_INDICES:
+            ent = energy_entropy_selected(
+                data, SELECTED_FREQ_INDICES[ch], sampling_rate)
+            features[f'{ch}_entropy'] = float(ent)  
+            entropy_dict[ch] = ent  # ✅ 엔트로피 저장
+
+    # -------- 운전 채널 mean/std --------
+    for op in ['Torque[Nm]', 'TC SP Front[°C]', 'TC SP Rear[°C]']:
+        if op in vib_df.columns:
+            arr = vib_df[op].values
+            features[f'{op}_mean'] = float(arr.mean())
+
+
+    # -------- 토크·온도 상호작용 --------
+    # ── (1) 토크와 각속도를 이용한 출력(Power) 계산 ─────────────────────────
+    if 'Torque[Nm]' in vib_df.columns:
+        
+        torque = vib_df['Torque[Nm]'].values
+        omega = 2 * np.pi * 1000 / 60             # 1000 rpm → 각속도 [rad/s]
+        power = np.mean(torque) * omega           # 평균 토크 × 각속도 → 출력 [Watt]
+
+        # ── (2-A) CHLI_front: 전방 온도를 기반으로 한 열 부하 지표 ────────────────
+        if 'TC SP Front[°C]' in vib_df.columns:
+            front_temp = vib_df['TC SP Front[°C]'].values
+            kelvin_front = front_temp + 273.15                    # 섭씨 → 켈빈 변환
+            chli_front = power / np.mean(kelvin_front)            # 출력 / 평균 온도
+            features['CHLI_front'] = float(chli_front)            # 최종 피처 저장
+
+        # ── (2-B) CHLI_rear: 후방 온도를 기반으로 한 열 부하 지표 ─────────────────
+        if 'TC SP Rear[°C]' in vib_df.columns:
+            rear_temp = vib_df['TC SP Rear[°C]'].values
+            kelvin_rear = rear_temp + 273.15                      # 섭씨 → 켈빈 변환
+            chli_rear = power / np.mean(kelvin_rear)              # 출력 / 평균 온도
+            features['CHLI_rear'] = float(chli_rear)              # 최종 피처 저장
+             
+
+    if 'Torque[Nm]' in vib_df.columns:
+      
+        torque_series = vib_df['Torque[Nm]'].values
+        features['iso_life_loss'] = iso_life_loss_from_torque(torque_series) 
+    
+
+         # --- FRONT/REAR ETCI + TWP 계산 ---
+    temp_front = vib_df['TC SP Front[°C]'].mean() if 'TC SP Front[°C]' in vib_df.columns else 30.0
+    temp_rear  = vib_df['TC SP Rear[°C]'].mean()  if 'TC SP Rear[°C]'  in vib_df.columns else 30.0
+
+    features['front_grease_arr'] = grease_thermal_degradation(temp_front)
+    features['rear_grease_arr']  = grease_thermal_degradation(temp_rear)
+
+
+    features['front_etci'] = compute_ETCI_inverse_group(
+        [entropy_dict.get('CH1', 1e-6), entropy_dict.get('CH2', 1e-6)],
+        temp_front
+    )
+    features['rear_etci'] = compute_ETCI_inverse_group(
+        [entropy_dict.get('CH3', 1e-6), entropy_dict.get('CH4', 1e-6)],
+        temp_rear
+    )
 
     return features
 
@@ -231,5 +358,5 @@ if __name__ == "__main__":
     pred_all = model.predict(X_seq).flatten()
     print(f"\n✅ 전체 학습 데이터에 대한 MAE: {mean_absolute_error(y_seq, pred_all):.3f}")
     
-    model.save("rul_final2_all_sets.h5")
-    print("\n💾 모델이 'rul_final2_all_sets.h5'로 저장되었습니다.")
+    model.save("rul_final2_all_sets1.h5")
+    print("\n💾 모델이 'rul_final2_all_sets1.h5'로 저장되었습니다.")
