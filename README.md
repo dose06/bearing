@@ -55,5 +55,66 @@ RUL log 변환 (log1p),  손실 함수 weighted MAE 이 상대 오차에는 좋�
 
 //////////////////////////////////////////////////////////////
 
+
+
+### 시간 순에 따른 데이터 추출 연구
+
+1. 입력 차원에 특징 벡터 만들기(mean, std, sum, max 등등) 
+
+  1 .  입력 차원에 엔트로피 성분 추가
+
+1. 엔트로피 계산에 사용할 주파수 추출 
+    - 고장 주파수
+    - 주파수 간격 ( f, Pxx = welch(data, fs=25600, nperseg=4096) )
+2. 채널 별 엔트로피 가중치 사용
+3. RUL 예측 개선을 위한 전략 3가지 적용
+    - RUL log 변환 (log1p) → 모델 안정화
+    -> 상대 오차는 줄었지만 점수가 낮음
+    - 손실 함수 weighted MAE → 작은 RUL 강조
+    -> 이 후 A_RUL 점수 최적화 목적 손실 함수인 approx_arul_loss 고려
+    - 예측 값 clipping (min=10) → MARE 튀는 현상 방지
+    -> 이 후 데이터 셋의 마지막 파일 제외하여 예측 값 clipping은 제외
+4. 초 단위 Labeling에서 파일  초 단위 분해 (10초→ 1초 단위)
+5. 학습 및 평가 데이터에서 마지막 파일 제외(마지막에 고장 판단)
+6. 훈련 및 평가 데이터 셋 고정
+    - Stratified split (RUL 구간 별) : 작은 RUL 샘플이 train/val 모두 일정 비율로 들어가도록 분할
+7. 토크 온도 관련 특성 추가
+    - 130도 이상의 데이터들에 대해 relu 함수
+8. ISO 281 공식으로 수명 L₁₀ → 기대수명 특성 추가
+9. 온도와 진동 관계식 추가
+    - ETCI (엔트로피 기반 온도 내구 지표)
+    - 자유에너지(Gibbs energy)
+
+### **신경망 연구**
+
+학습 데이터 수 (N) = 12,286개 (시퀀스 수 기준)
+
+LSTM 모델 파라미터 수 (P) ≈ 24,900개
+
+비율 (N / P) ≈ 0.49
+
+→ 과적합(overfitting) 가능성이 높음
+
+Dropout, L2 정규화, EarlyStopping 같은 규제(regularization) 기법
+Conv1D    SimpleRNN(16)  같은 신경망 사용
+
+GRU+attention: 단순 LSTM에 비해 성능이 잘 나오지 않음
+
+-> 데이터 양에 비해서 많은 파라미터 수로 과적합이 유발 되었음
+-> 엔트로피 가중치를 파라미터화 시키려면 attention을 사용해야하는거같은데 파라미터가 너무 많아져서 쓰기가 어려울거같음
+
+MLP (다층 퍼셉트론) , XGBoost,  ,랜덤 포레스트 (Random Forest) 등을 실험 
+
+입력
+├─ F_front  → GRU(32)ㅣ
+├─ F_rear   → GRU(32) ㅏ ──→ Concatenate → Dense(64) → Self-Attention → Dense(1) 이런 구조도 실험 
+→ 기존  lstm이 가장 낫다
+
+SCORE 연구
+
+10분전 데이터까지 사용해서 +600초 해서 추가
+
+점수 계산시 ,절삭 평균을 구한다 상위 2개 하위 1개 빼고 평균 구하기
+
 노션 정리 주소
 https://ambiguous-origami-76c.notion.site/1d59d01c0fbe806ba862cf6062a856ac?pvs=4
